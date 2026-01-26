@@ -1,0 +1,12 @@
+LICENSE
+pyproject.toml
+dobisvd.egg-info/PKG-INFO
+dobisvd.egg-info/SOURCES.txt
+dobisvd.egg-info/dependency_links.txt
+dobisvd.egg-info/requires.txt
+dobisvd.egg-info/top_level.txt
+modules/IncrementalPCA.py
+modules/module.py
+modules/remapping.py
+modules/stable_svd.py
+utils/datautils.py

@@ -1,0 +1,24 @@
+Metadata-Version: 2.4
+Name: dobisvd
+Version: 0.1
+Summary: Dobi-SVD: Differentiable SVD for LLM Compression and Some New Perspectives
+Project-URL: Homepage, TODO
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: Apache Software License
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: lm_eval==0.4.7
+Requires-Dist: torch==2.1.2
+Requires-Dist: transformers==4.37.2
+Requires-Dist: accelerate==0.26.0
+Requires-Dist: datasets==3.3.2
+Requires-Dist: triton==2.1.0
+Requires-Dist: bitsandbytes==0.44.1
+Requires-Dist: numpy==1.26.4
+Requires-Dist: wandb==0.18.5
+Requires-Dist: peft==0.13.2
+Provides-Extra: eval
+Requires-Dist: protobuf; extra == "eval"
+Requires-Dist: datasets; extra == "eval"
+Dynamic: license-file
