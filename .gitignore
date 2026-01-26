@@ -1,0 +1,20 @@
+# model checkpoints
+*.pt
+*.bin
+*.safetensors
+
+# datasets / caches
+.cache/
+datasets/
+__pycache__/
+*.pyc
+
+# envs
+miniconda3/
+.env/
+
+# logs
+*.log
+
+# vscode
+.vscode/
