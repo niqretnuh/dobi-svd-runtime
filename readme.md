@@ -39,5 +39,6 @@ The current release model (0.4 means compression ratio = 40%):
 
 You can quickly start evaluating the task performance of the downloaded model.
 
-```python evaluate_speed_standalone.py --model_path <path_to_model>
+```
+python evaluate_speed_standalone.py --model_path <path_to_model>
 ```
