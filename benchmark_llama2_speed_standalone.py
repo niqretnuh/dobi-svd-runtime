@@ -411,6 +411,97 @@ def _apply_rope_standalone(q, k, cos, sin, position_ids):
     return q_embed, k_embed
 
 
+def _apply_rope_to_q_standalone(q, cos, sin, position_ids):
+    cos, sin = _select_rope_positions(cos, sin, position_ids)
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    return q_embed
+
+
+def _apply_inverse_rope_for_key_positions(q_rope, cos, sin, key_position_ids):
+    """
+    Applies R_j^T to a RoPE-rotated query for a chunk of key positions.
+
+    q_rope:
+        [batch, num_heads, q_len, head_dim]
+
+    key_position_ids:
+        [chunk]
+
+    Returns:
+        q_unrot:
+            [batch, num_heads, q_len, chunk, head_dim]
+    """
+    key_position_ids = key_position_ids.view(1, -1)
+    cos_key, sin_key = _select_rope_positions(cos, sin, key_position_ids)
+
+    # [1, 1, chunk, head_dim] -> [1, 1, 1, chunk, head_dim]
+    cos_key = cos_key.unsqueeze(2)
+    sin_key = sin_key.unsqueeze(2)
+
+    # [batch, heads, q_len, head_dim] -> [batch, heads, q_len, 1, head_dim]
+    q_expanded = q_rope.unsqueeze(3)
+
+    # Inverse RoPE: R_j^T x.
+    return (q_expanded * cos_key) - (_rotate_half(q_expanded) * sin_key)
+
+
+def _lowrank_k_scores_from_compressed_cache(
+    q_rope: torch.Tensor,
+    z_key_cache: torch.Tensor,
+    u_for_heads: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    head_dim: int,
+    chunk_size: int,
+):
+    """
+    Computes attention scores against a compressed low-rank K cache.
+
+    q_rope:
+        [batch, num_heads, q_len, head_dim]
+
+    z_key_cache:
+        [batch, total_seq, rank_k]
+
+    u_for_heads:
+        [num_heads, head_dim, rank_k]
+
+    Returns:
+        scores:
+            [batch, num_heads, q_len, total_seq]
+    """
+    device = q_rope.device
+    bsz, num_heads, q_len, _ = q_rope.shape
+    total_seq = z_key_cache.shape[1]
+
+    score_chunks = []
+
+    for start in range(0, total_seq, chunk_size):
+        end = min(start + chunk_size, total_seq)
+        key_pos = torch.arange(start, end, device=device, dtype=torch.long)
+
+        q_unrot = _apply_inverse_rope_for_key_positions(
+            q_rope=q_rope,
+            cos=cos,
+            sin=sin,
+            key_position_ids=key_pos,
+        )
+
+        # q_unrot:    [batch, heads, q_len, chunk, head_dim]
+        # u_for_heads: [heads, head_dim, rank_k]
+        # q_low:      [batch, heads, q_len, chunk, rank_k]
+        q_low = torch.einsum("bhqsd,hdr->bhqsr", q_unrot, u_for_heads)
+
+        z_chunk = z_key_cache[:, start:end, :]
+
+        # scores_chunk: [batch, heads, q_len, chunk]
+        scores_chunk = torch.einsum("bhqsr,bsr->bhqs", q_low, z_chunk)
+        score_chunks.append(scores_chunk)
+
+    scores = torch.cat(score_chunks, dim=-1)
+    return scores / math.sqrt(head_dim)
+
+
 def _validate_lowrank_v_cache_model(model):
     if not hasattr(model, "model") or not hasattr(model.model, "layers"):
         raise RuntimeError("--lowrank_v_cache currently expects a LLaMA-style model.")
@@ -427,6 +518,32 @@ def _validate_lowrank_v_cache_model(model):
         n_checked += 1
 
     print(f"[lowrank-v-cache] validated {n_checked} attention layers")
+
+
+def _validate_lowrank_kv_cache_model(model):
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise RuntimeError("--lowrank_k_cache currently expects a LLaMA-style model.")
+
+    n_checked = 0
+    for layer in model.model.layers:
+        attn = layer.self_attn
+
+        if not isinstance(attn.k_proj, LowRankLinear):
+            raise RuntimeError(
+                "--lowrank_k_cache requires every self_attn.k_proj to be LowRankLinear. "
+                "Use --model_kind lowrank with a checkpoint whose k_proj modules were "
+                "low-rank decomposed."
+            )
+
+        if not isinstance(attn.v_proj, LowRankLinear):
+            raise RuntimeError(
+                "--lowrank_k_cache also requires every self_attn.v_proj to be LowRankLinear, "
+                "because this path uses compressed K and compressed V together."
+            )
+
+        n_checked += 1
+
+    print(f"[lowrank-kv-cache] validated {n_checked} attention layers")
 
 
 def _lowrank_v_attention_forward(
@@ -555,6 +672,176 @@ def _lowrank_v_attention_forward(
     return attn_output, key_cache, z_value_cache
 
 
+def _lowrank_kv_attention_forward(
+    attn,
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    past_z_key: torch.Tensor | None,
+    past_z_value: torch.Tensor | None,
+    rotary_emb=None,
+    k_score_chunk_size: int = 256,
+):
+    """
+    LLaMA-style attention with compressed K and compressed V cache.
+
+    Cache format:
+        z_key_cache:   [batch, total_seq, rank_k]
+        z_value_cache: [batch, total_seq, rank_v]
+
+    For prefill, this reconstructs the current full K inside the layer only.
+    For decode, it computes scores directly from compressed K coefficients:
+
+        score_ij = q_i^T R_i^T R_j U_k z_j
+                 = (U_k^T R_j^T q_rope_i)^T z_j
+
+    so the persistent K cache stays low-rank.
+    """
+    if not isinstance(attn.k_proj, LowRankLinear):
+        raise RuntimeError("Expected attn.k_proj to be LowRankLinear.")
+    if not isinstance(attn.v_proj, LowRankLinear):
+        raise RuntimeError("Expected attn.v_proj to be LowRankLinear.")
+
+    bsz, q_len, _ = hidden_states.shape
+    device = hidden_states.device
+
+    cfg = getattr(attn, "config", None)
+    num_heads = int(
+        getattr(attn, "num_heads", None)
+        or (cfg.num_attention_heads if cfg is not None else None)
+    )
+    num_kv_heads = int(
+        getattr(attn, "num_key_value_heads", None)
+        or (cfg.num_key_value_heads if cfg is not None else num_heads)
+    )
+    num_kv_groups = int(
+        getattr(attn, "num_key_value_groups", num_heads // num_kv_heads)
+    )
+    head_dim = int(
+        getattr(attn, "head_dim", None)
+        or (cfg.hidden_size // cfg.num_attention_heads if cfg is not None else None)
+    )
+
+    query_states = attn.q_proj(hidden_states)
+    query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+
+    # Low-rank K and V coefficients.
+    z_key_states = attn.k_proj.v_proj(hidden_states)
+    z_value_states = attn.v_proj.v_proj(hidden_states)
+
+    past_len = 0 if past_z_key is None else past_z_key.shape[1]
+    kv_seq_len = past_len + q_len
+
+    rope = rotary_emb if rotary_emb is not None else getattr(attn, "rotary_emb", None)
+    cos, sin = _get_rope_cos_sin(
+        rotary_emb=rope,
+        query_states=query_states,
+        position_ids=position_ids,
+        kv_seq_len=kv_seq_len,
+    )
+
+    query_states = _apply_rope_to_q_standalone(
+        query_states,
+        cos,
+        sin,
+        position_ids,
+    )
+
+    if past_z_key is not None:
+        z_key_cache = torch.cat([past_z_key, z_key_states], dim=1)
+        z_value_cache = torch.cat([past_z_value, z_value_states], dim=1)
+    else:
+        z_key_cache = z_key_states
+        z_value_cache = z_value_states
+
+    # Build per-query-head U_k blocks.
+    k_u_weight = attn.k_proj.u_proj.weight
+    rank_k = int(attn.k_proj.rank)
+    expected_k_out = num_kv_heads * head_dim
+
+    if k_u_weight.shape[0] != expected_k_out:
+        raise RuntimeError(
+            f"Unexpected k_proj.u_proj output dimension: got {k_u_weight.shape[0]}, "
+            f"expected {expected_k_out} = num_kv_heads({num_kv_heads}) * head_dim({head_dim})."
+        )
+
+    k_u_blocks = k_u_weight.view(num_kv_heads, head_dim, rank_k)
+    kv_head_for_query_head = torch.arange(num_heads, device=device) // num_kv_groups
+    k_u_for_heads = k_u_blocks[kv_head_for_query_head]
+
+    if past_z_key is None:
+        # Prefill path: reconstruct K only inside this layer for the prompt pass.
+        # The persistent cache still stores z_key_cache, not full K.
+        key_states = attn.k_proj.u_proj(z_key_states)
+        key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+
+        _, key_states = _apply_rope_standalone(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            position_ids,
+        )
+
+        key_for_scores = _repeat_kv(key_states, num_kv_groups)
+        attn_scores = torch.matmul(query_states, key_for_scores.transpose(2, 3))
+        attn_scores = attn_scores / math.sqrt(head_dim)
+    else:
+        # Decode path: compute scores from compressed K without reconstruction.
+        attn_scores = _lowrank_k_scores_from_compressed_cache(
+            q_rope=query_states,
+            z_key_cache=z_key_cache,
+            u_for_heads=k_u_for_heads,
+            cos=cos,
+            sin=sin,
+            head_dim=head_dim,
+            chunk_size=k_score_chunk_size,
+        )
+
+    key_positions = torch.arange(kv_seq_len, device=device).view(1, 1, 1, kv_seq_len)
+    query_positions = position_ids.view(bsz, 1, q_len, 1)
+    causal_mask = key_positions <= query_positions
+    attn_scores = attn_scores.masked_fill(~causal_mask, torch.finfo(attn_scores.dtype).min)
+
+    if attention_mask is not None:
+        key_padding_mask = attention_mask[:, None, None, :kv_seq_len].to(torch.bool)
+        attn_scores = attn_scores.masked_fill(
+            ~key_padding_mask,
+            torch.finfo(attn_scores.dtype).min,
+        )
+
+    attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(query_states.dtype)
+
+    # Compressed V aggregation, same shape as the V-cache path.
+    z_context = torch.einsum("bhqs,bsr->bhqr", attn_probs, z_value_cache)
+
+    v_u_weight = attn.v_proj.u_proj.weight
+    rank_v = int(attn.v_proj.rank)
+    expected_v_out = num_kv_heads * head_dim
+
+    if v_u_weight.shape[0] != expected_v_out:
+        raise RuntimeError(
+            f"Unexpected v_proj.u_proj output dimension: got {v_u_weight.shape[0]}, "
+            f"expected {expected_v_out} = num_kv_heads({num_kv_heads}) * head_dim({head_dim})."
+        )
+
+    v_u_blocks = v_u_weight.view(num_kv_heads, head_dim, rank_v)
+    v_u_for_heads = v_u_blocks[kv_head_for_query_head]
+
+    attn_output = torch.einsum("bhqr,hdr->bhqd", z_context, v_u_for_heads)
+
+    if attn.v_proj.u_proj.bias is not None:
+        bias_blocks = attn.v_proj.u_proj.bias.view(num_kv_heads, head_dim)
+        bias_for_heads = bias_blocks[kv_head_for_query_head]
+        attn_output = attn_output + bias_for_heads.view(1, num_heads, 1, head_dim)
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, num_heads * head_dim)
+    attn_output = attn.o_proj(attn_output)
+
+    return attn_output, z_key_cache, z_value_cache
+
+
 @torch.inference_mode()
 def lowrank_v_cache_forward(model, input_ids, attention_mask, past_layer_caches=None):
     """
@@ -651,6 +938,121 @@ def lowrank_v_cache_generate(model, input_ids, attention_mask, max_new_tokens):
             input_ids=next_token,
             attention_mask=attention_mask,
             past_layer_caches=layer_caches,
+        )
+
+    return generated
+
+
+@torch.inference_mode()
+def lowrank_kv_cache_forward(
+    model,
+    input_ids,
+    attention_mask,
+    past_layer_caches=None,
+    k_score_chunk_size: int = 256,
+):
+    """
+    Minimal standalone LLaMA forward pass using compressed K and compressed V cache.
+
+    past_layer_caches:
+        None, or list of length num_layers. Each entry is:
+            (z_key_cache, z_value_cache)
+    """
+    decoder = model.model
+    bsz, q_len = input_ids.shape
+    device = input_ids.device
+
+    decoder_rotary_emb = getattr(decoder, "rotary_emb", None)
+
+    past_len = 0
+    if past_layer_caches is not None and past_layer_caches[0] is not None:
+        past_len = past_layer_caches[0][0].shape[1]
+
+    position_ids = torch.arange(
+        past_len,
+        past_len + q_len,
+        device=device,
+        dtype=torch.long,
+    ).unsqueeze(0).expand(bsz, -1)
+
+    hidden_states = decoder.embed_tokens(input_ids)
+    new_layer_caches = []
+
+    for layer_idx, decoder_layer in enumerate(decoder.layers):
+        past_z_key = None
+        past_z_value = None
+
+        if past_layer_caches is not None:
+            past_z_key, past_z_value = past_layer_caches[layer_idx]
+
+        residual = hidden_states
+        hidden_states_norm = decoder_layer.input_layernorm(hidden_states)
+
+        attn_output, new_z_key, new_z_value = _lowrank_kv_attention_forward(
+            attn=decoder_layer.self_attn,
+            hidden_states=hidden_states_norm,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_z_key=past_z_key,
+            past_z_value=past_z_value,
+            rotary_emb=decoder_rotary_emb,
+            k_score_chunk_size=k_score_chunk_size,
+        )
+
+        hidden_states = residual + attn_output
+
+        residual = hidden_states
+        hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
+        hidden_states = decoder_layer.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        new_layer_caches.append((new_z_key, new_z_value))
+
+    hidden_states = decoder.norm(hidden_states)
+    logits = model.lm_head(hidden_states)
+
+    return logits, new_layer_caches
+
+
+@torch.inference_mode()
+def lowrank_kv_cache_generate(
+    model,
+    input_ids,
+    attention_mask,
+    max_new_tokens,
+    k_score_chunk_size: int = 256,
+):
+    """
+    Greedy generation using compressed K and compressed V cache.
+    """
+    generated = input_ids
+
+    logits, layer_caches = lowrank_kv_cache_forward(
+        model=model,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        past_layer_caches=None,
+        k_score_chunk_size=k_score_chunk_size,
+    )
+
+    for gen_idx in range(max_new_tokens):
+        next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+        generated = torch.cat([generated, next_token], dim=1)
+
+        attention_mask = torch.cat(
+            [attention_mask, torch.ones_like(next_token, device=attention_mask.device)],
+            dim=1,
+        )
+
+        if gen_idx + 1 >= max_new_tokens:
+            break
+
+        logits, layer_caches = lowrank_kv_cache_forward(
+            model=model,
+            input_ids=next_token,
+            attention_mask=attention_mask,
+            past_layer_caches=layer_caches,
+            k_score_chunk_size=k_score_chunk_size,
         )
 
     return generated
@@ -804,6 +1206,89 @@ def benchmark_generate_lowrank_v_cache(model, tokenizer, loader, device, gen_len
     return summary, rows
 
 
+@torch.inference_mode()
+def benchmark_generate_lowrank_kv_cache(
+    model,
+    tokenizer,
+    loader,
+    device,
+    gen_len,
+    num_batches,
+    warmup,
+    k_score_chunk_size: int = 256,
+):
+    if device.type != "cuda":
+        raise RuntimeError("This benchmark script expects CUDA.")
+
+    _validate_lowrank_kv_cache_model(model)
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
+
+    weight_mem = torch.cuda.memory_allocated(device)
+
+    total_time = 0.0
+    total_new_tokens = 0
+    rows = []
+
+    for step, (input_ids,) in enumerate(loader):
+        input_ids = input_ids.to(device, non_blocking=True)
+        attention_mask = torch.ones_like(input_ids, device=device)
+
+        torch.cuda.synchronize(device)
+        t0 = time.perf_counter()
+
+        _ = lowrank_kv_cache_generate(
+            model=model,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=gen_len,
+            k_score_chunk_size=k_score_chunk_size,
+        )
+
+        torch.cuda.synchronize(device)
+        dt = time.perf_counter() - t0
+
+        if step < warmup:
+            print(f"[warmup {step + 1}/{warmup}] {dt:.4f}s")
+            continue
+
+        measured_idx = step - warmup + 1
+        new_tokens = input_ids.shape[0] * gen_len
+        tok_s = new_tokens / dt
+
+        total_time += dt
+        total_new_tokens += new_tokens
+
+        rows.append(
+            {
+                "batch_idx": measured_idx,
+                "seconds": dt,
+                "new_tokens": new_tokens,
+                "new_tokens_per_sec": tok_s,
+            }
+        )
+
+        print(f"[batch {measured_idx}/{num_batches}] {dt:.4f}s | {tok_s:.2f} new tok/s")
+
+        if measured_idx >= num_batches:
+            break
+
+    peak_mem = torch.cuda.max_memory_allocated(device)
+
+    summary = {
+        "throughput_new_tokens_per_sec": total_new_tokens / total_time,
+        "total_measured_seconds": total_time,
+        "total_new_tokens": total_new_tokens,
+        "weight_mem_gb": weight_mem / 2**30,
+        "peak_mem_gb": peak_mem / 2**30,
+        "activation_cache_mem_gb": (peak_mem - weight_mem) / 2**30,
+    }
+
+    return summary, rows
+
+
 def append_csv(path, row):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     exists = os.path.exists(path)
@@ -863,6 +1348,20 @@ def main():
             "Requires --model_kind lowrank and LowRankLinear self_attn.v_proj modules."
         ),
     )
+    ap.add_argument(
+        "--lowrank_k_cache",
+        action="store_true",
+        help=(
+            "Use standalone compressed K+V cache generation. "
+            "Requires --model_kind lowrank and LowRankLinear self_attn.k_proj/self_attn.v_proj modules."
+        ),
+    )
+    ap.add_argument(
+        "--k_score_chunk_size",
+        type=int,
+        default=256,
+        help="Chunk size used when computing decode attention scores from compressed K cache.",
+    )
 
     # Output
     ap.add_argument(
@@ -882,8 +1381,14 @@ def main():
     if args.lowrank_v_cache and args.model_kind != "lowrank":
         raise ValueError("--lowrank_v_cache requires --model_kind lowrank")
 
-    if args.lowrank_v_cache and args.compile:
-        raise ValueError("--lowrank_v_cache currently does not support --compile")
+    if args.lowrank_k_cache and args.model_kind != "lowrank":
+        raise ValueError("--lowrank_k_cache requires --model_kind lowrank")
+
+    if args.lowrank_k_cache and args.lowrank_v_cache:
+        raise ValueError("Use either --lowrank_v_cache or --lowrank_k_cache, not both.")
+
+    if (args.lowrank_v_cache or args.lowrank_k_cache) and args.compile:
+        raise ValueError("Standalone low-rank cache paths currently do not support --compile")
 
     free, total = torch.cuda.mem_get_info(device)
     print(f"[preflight] CUDA free={free / 2**30:.2f} GB / total={total / 2**30:.2f} GB")
@@ -900,6 +1405,8 @@ def main():
     print("prompt_len:", args.prompt_len)
     print("gen_len:", args.gen_len)
     print("lowrank_v_cache:", args.lowrank_v_cache)
+    print("lowrank_k_cache:", args.lowrank_k_cache)
+    print("k_score_chunk_size:", args.k_score_chunk_size)
     print("batch_size:", args.batch_size)
     print("=" * 80)
 
@@ -945,7 +1452,19 @@ def main():
     )
 
     # 5. Benchmark
-    if args.lowrank_v_cache:
+    if args.lowrank_k_cache:
+        summary, batch_rows = benchmark_generate_lowrank_kv_cache(
+            model=model,
+            tokenizer=tokenizer,
+            loader=loader,
+            device=device,
+            gen_len=args.gen_len,
+            num_batches=args.num_batches,
+            warmup=args.warmup,
+            k_score_chunk_size=args.k_score_chunk_size,
+        )
+        kv_cache_impl = "lowrank_kv_cache_phase2"
+    elif args.lowrank_v_cache:
         summary, batch_rows = benchmark_generate_lowrank_v_cache(
             model=model,
             tokenizer=tokenizer,
@@ -955,6 +1474,7 @@ def main():
             num_batches=args.num_batches,
             warmup=args.warmup,
         )
+        kv_cache_impl = "lowrank_v_cache_phase1"
     else:
         summary, batch_rows = benchmark_generate(
             model=model,
@@ -965,6 +1485,7 @@ def main():
             num_batches=args.num_batches,
             warmup=args.warmup,
         )
+        kv_cache_impl = "hf_generate_default"
 
     result_row = {
         "label": args.label,
@@ -976,7 +1497,8 @@ def main():
         "cuda_version": torch.version.cuda,
         "dtype": args.dtype,
         "compile": args.compile,
-        "kv_cache_impl": "lowrank_v_cache_phase1" if args.lowrank_v_cache else "hf_generate_default",
+        "kv_cache_impl": kv_cache_impl,
+        "k_score_chunk_size": args.k_score_chunk_size if args.lowrank_k_cache else "",
         "prompt_len": args.prompt_len,
         "gen_len": args.gen_len,
         "batch_size": args.batch_size,
@@ -994,7 +1516,8 @@ def main():
             {
                 "label": args.label,
                 "compile": args.compile,
-                "kv_cache_impl": "lowrank_v_cache_phase1" if args.lowrank_v_cache else "hf_generate_default",
+                "kv_cache_impl": kv_cache_impl,
+                "k_score_chunk_size": args.k_score_chunk_size if args.lowrank_k_cache else "",
                 "prompt_len": args.prompt_len,
                 "gen_len": args.gen_len,
                 "batch_size": args.batch_size,
