@@ -1089,6 +1089,250 @@ def lowrank_v_cache_generate(model, input_ids, attention_mask, max_new_tokens):
     return generated
 
 
+def _allocate_lowrank_v_cache(model, batch_size: int, max_seq_len: int, device, dtype):
+    """
+    Preallocates per-layer K and V caches for the V-only path.
+
+    Returns a list of dicts, one per decoder layer:
+        {
+            "v_lowrank": bool,
+            "k":   [batch, num_kv_heads, max_seq_len, head_dim],
+            "v_z": [batch, max_seq_len, rank_v]                   (if v_lowrank)
+            "v":   [batch, num_kv_heads, max_seq_len, head_dim]   (if not v_lowrank)
+        }
+    """
+    caches = []
+    for layer in model.model.layers:
+        attn = layer.self_attn
+        num_heads, num_kv_heads, num_kv_groups, head_dim = _get_llama_attn_dims(attn)
+        v_lowrank = _is_lowrank_module(attn.v_proj)
+
+        k_buf = torch.empty(
+            batch_size, num_kv_heads, max_seq_len, head_dim,
+            device=device, dtype=dtype,
+        )
+        if v_lowrank:
+            rank_v = int(attn.v_proj.rank)
+            v_z_buf = torch.empty(
+                batch_size, max_seq_len, rank_v,
+                device=device, dtype=dtype,
+            )
+            v_buf = None
+        else:
+            v_z_buf = None
+            v_buf = torch.empty(
+                batch_size, num_kv_heads, max_seq_len, head_dim,
+                device=device, dtype=dtype,
+            )
+
+        caches.append({
+            "v_lowrank": v_lowrank,
+            "k": k_buf,
+            "v_z": v_z_buf,
+            "v": v_buf,
+        })
+
+    return caches
+
+
+def _lowrank_v_attention_forward_inplace(
+    attn,
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask_full: torch.Tensor,
+    layer_cache: dict,
+    write_pos: int,
+    kv_seq_len: int,
+    rotary_emb=None,
+):
+    """
+    V-only attention with preallocated cache. Writes new K and V (or V_z)
+    into layer_cache at slots [write_pos : write_pos + q_len] and reads the
+    prefix [: kv_seq_len] for scoring.
+    """
+    bsz, q_len, _ = hidden_states.shape
+    device = hidden_states.device
+    num_heads, num_kv_heads, num_kv_groups, head_dim = _get_llama_attn_dims(attn)
+
+    query_states = attn.q_proj(hidden_states).view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+    key_states = attn.k_proj(hidden_states).view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+
+    rope = rotary_emb if rotary_emb is not None else getattr(attn, "rotary_emb", None)
+    cos, sin = _get_rope_cos_sin(
+        rotary_emb=rope,
+        query_states=query_states,
+        position_ids=position_ids,
+        kv_seq_len=kv_seq_len,
+    )
+    query_states, key_states = _apply_rope_standalone(
+        query_states, key_states, cos, sin, position_ids,
+    )
+
+    # In-place writes into preallocated cache.
+    layer_cache["k"][:, :, write_pos:write_pos + q_len, :] = key_states
+
+    v_lowrank = layer_cache["v_lowrank"]
+    if v_lowrank:
+        z_value_states = attn.v_proj.v_proj(hidden_states)
+        layer_cache["v_z"][:, write_pos:write_pos + q_len, :] = z_value_states
+    else:
+        value_states = attn.v_proj(hidden_states).view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+        layer_cache["v"][:, :, write_pos:write_pos + q_len, :] = value_states
+
+    key_cache_prefix = layer_cache["k"][:, :, :kv_seq_len, :]
+    key_for_scores = _repeat_kv(key_cache_prefix, num_kv_groups)
+
+    attn_scores = torch.matmul(query_states, key_for_scores.transpose(2, 3))
+    attn_scores = attn_scores / math.sqrt(head_dim)
+
+    key_positions = torch.arange(kv_seq_len, device=device).view(1, 1, 1, kv_seq_len)
+    query_positions = position_ids.view(bsz, 1, q_len, 1)
+    causal_mask = key_positions <= query_positions
+    attn_scores = attn_scores.masked_fill(~causal_mask, torch.finfo(attn_scores.dtype).min)
+
+    if attention_mask_full is not None:
+        key_padding_mask = attention_mask_full[:, None, None, :kv_seq_len].to(torch.bool)
+        attn_scores = attn_scores.masked_fill(
+            ~key_padding_mask,
+            torch.finfo(attn_scores.dtype).min,
+        )
+
+    attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(query_states.dtype)
+
+    if v_lowrank:
+        z_value_prefix = layer_cache["v_z"][:, :kv_seq_len, :]
+        z_context = torch.einsum("bhqs,bsr->bhqr", attn_probs, z_value_prefix)
+
+        u_weight = attn.v_proj.u_proj.weight
+        rank_v = int(attn.v_proj.rank)
+        u_blocks = u_weight.view(num_kv_heads, head_dim, rank_v)
+        kv_head_for_query_head = torch.arange(num_heads, device=device) // num_kv_groups
+        u_for_heads = u_blocks[kv_head_for_query_head]
+        attn_output = torch.einsum("bhqr,hdr->bhqd", z_context, u_for_heads)
+
+        if attn.v_proj.u_proj.bias is not None:
+            bias_blocks = attn.v_proj.u_proj.bias.view(num_kv_heads, head_dim)
+            bias_for_heads = bias_blocks[kv_head_for_query_head]
+            attn_output = attn_output + bias_for_heads.view(1, num_heads, 1, head_dim)
+    else:
+        v_prefix = layer_cache["v"][:, :, :kv_seq_len, :]
+        v_for_context = _repeat_kv(v_prefix, num_kv_groups)
+        attn_output = torch.matmul(attn_probs, v_for_context)
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, num_heads * head_dim)
+    attn_output = attn.o_proj(attn_output)
+    return attn_output
+
+
+@torch.inference_mode()
+def lowrank_v_cache_forward_inplace(
+    model,
+    input_ids,
+    attention_mask_full,
+    layer_caches,
+    write_pos: int,
+    kv_seq_len: int,
+):
+    decoder = model.model
+    bsz, q_len = input_ids.shape
+    device = input_ids.device
+    decoder_rotary_emb = getattr(decoder, "rotary_emb", None)
+
+    position_ids = torch.arange(
+        write_pos, kv_seq_len, device=device, dtype=torch.long,
+    ).unsqueeze(0).expand(bsz, -1)
+
+    hidden_states = decoder.embed_tokens(input_ids)
+
+    for layer_idx, decoder_layer in enumerate(decoder.layers):
+        residual = hidden_states
+        hidden_states_norm = decoder_layer.input_layernorm(hidden_states)
+
+        attn_output = _lowrank_v_attention_forward_inplace(
+            attn=decoder_layer.self_attn,
+            hidden_states=hidden_states_norm,
+            position_ids=position_ids,
+            attention_mask_full=attention_mask_full,
+            layer_cache=layer_caches[layer_idx],
+            write_pos=write_pos,
+            kv_seq_len=kv_seq_len,
+            rotary_emb=decoder_rotary_emb,
+        )
+
+        hidden_states = residual + attn_output
+
+        residual = hidden_states
+        hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
+        hidden_states = decoder_layer.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+    hidden_states = decoder.norm(hidden_states)
+    logits = model.lm_head(hidden_states)
+    return logits
+
+
+@torch.inference_mode()
+def lowrank_v_cache_generate_prealloc(model, input_ids, attention_mask, max_new_tokens):
+    """
+    Greedy generation using the preallocated V-only cache path.
+
+    Allocates K and V (or V_z) cache buffers of size [batch, ..., prompt_len + max_new_tokens, ...]
+    once at the start, then writes new K/V slices in-place at each step instead
+    of growing via torch.cat.
+    """
+    bsz, prompt_len = input_ids.shape
+    device = input_ids.device
+    max_seq = prompt_len + max_new_tokens
+
+    sample_attn = model.model.layers[0].self_attn
+    weight_for_dtype = (
+        sample_attn.q_proj.weight
+        if isinstance(sample_attn.q_proj, nn.Linear)
+        else sample_attn.q_proj.u_proj.weight
+    )
+    cache_dtype = weight_for_dtype.dtype
+
+    layer_caches = _allocate_lowrank_v_cache(model, bsz, max_seq, device, cache_dtype)
+
+    attention_mask_full = torch.ones(bsz, max_seq, device=device, dtype=attention_mask.dtype)
+    attention_mask_full[:, :prompt_len] = attention_mask
+
+    generated = torch.empty(bsz, max_seq, device=device, dtype=input_ids.dtype)
+    generated[:, :prompt_len] = input_ids
+
+    # Prefill writes [0:prompt_len].
+    logits = lowrank_v_cache_forward_inplace(
+        model=model,
+        input_ids=input_ids,
+        attention_mask_full=attention_mask_full,
+        layer_caches=layer_caches,
+        write_pos=0,
+        kv_seq_len=prompt_len,
+    )
+
+    cur_pos = prompt_len
+
+    for gen_idx in range(max_new_tokens):
+        next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+        generated[:, cur_pos:cur_pos + 1] = next_token
+
+        if gen_idx + 1 >= max_new_tokens:
+            break
+
+        logits = lowrank_v_cache_forward_inplace(
+            model=model,
+            input_ids=next_token,
+            attention_mask_full=attention_mask_full,
+            layer_caches=layer_caches,
+            write_pos=cur_pos,
+            kv_seq_len=cur_pos + 1,
+        )
+        cur_pos += 1
+
+    return generated[:, :prompt_len + max_new_tokens]
+
+
 @torch.inference_mode()
 def lowrank_kv_cache_forward(
     model,
@@ -1280,11 +1524,20 @@ def benchmark_generate(model, tokenizer, loader, device, gen_len, num_batches, w
 
 
 @torch.inference_mode()
-def benchmark_generate_lowrank_v_cache(model, tokenizer, loader, device, gen_len, num_batches, warmup):
+def benchmark_generate_lowrank_v_cache(
+    model, tokenizer, loader, device, gen_len, num_batches, warmup,
+    prealloc: bool = False,
+):
     if device.type != "cuda":
         raise RuntimeError("This benchmark script expects CUDA.")
 
     _validate_lowrank_v_cache_model(model)
+
+    if prealloc:
+        print("[lowrank-v-cache] using preallocated cache path")
+        gen_fn = lowrank_v_cache_generate_prealloc
+    else:
+        gen_fn = lowrank_v_cache_generate
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
@@ -1303,7 +1556,7 @@ def benchmark_generate_lowrank_v_cache(model, tokenizer, loader, device, gen_len
         torch.cuda.synchronize(device)
         t0 = time.perf_counter()
 
-        _ = lowrank_v_cache_generate(
+        _ = gen_fn(
             model=model,
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1529,6 +1782,14 @@ def main():
         ),
     )
     ap.add_argument(
+        "--vcache_prealloc",
+        action="store_true",
+        help=(
+            "Use preallocated K/V cache buffers for the V-only path "
+            "(avoids torch.cat per decode step). Combine with --lowrank_v_cache."
+        ),
+    )
+    ap.add_argument(
         "--lowrank_k_cache",
         action="store_true",
         help=(
@@ -1577,6 +1838,9 @@ def main():
     if args.lowrank_k_cache and args.model_kind != "lowrank":
         raise ValueError("--lowrank_k_cache requires --model_kind lowrank")
 
+    if args.vcache_prealloc and not args.lowrank_v_cache:
+        raise ValueError("--vcache_prealloc requires --lowrank_v_cache")
+
     if args.lowrank_k_cache and args.lowrank_v_cache:
         raise ValueError("Use either --lowrank_v_cache or --lowrank_k_cache, not both.")
 
@@ -1598,6 +1862,7 @@ def main():
     print("prompt_len:", args.prompt_len)
     print("gen_len:", args.gen_len)
     print("lowrank_v_cache:", args.lowrank_v_cache)
+    print("vcache_prealloc:", args.vcache_prealloc)
     print("lowrank_k_cache:", args.lowrank_k_cache)
     print("k_score_chunk_size:", args.k_score_chunk_size)
     print("batch_size:", args.batch_size)
@@ -1668,8 +1933,13 @@ def main():
             gen_len=args.gen_len,
             num_batches=args.num_batches,
             warmup=args.warmup,
+            prealloc=args.vcache_prealloc,
         )
-        kv_cache_impl = "lowrank_v_cache_phase1"
+        kv_cache_impl = (
+            "lowrank_v_cache_phase1_prealloc"
+            if args.vcache_prealloc
+            else "lowrank_v_cache_phase1"
+        )
     else:
         summary, batch_rows = benchmark_generate(
             model=model,
@@ -1685,7 +1955,7 @@ def main():
     if args.lowrank_k_cache:
         cache_mode_tag = "kv_both"
     elif args.lowrank_v_cache:
-        cache_mode_tag = "v_only"
+        cache_mode_tag = "v_only_prealloc" if args.vcache_prealloc else "v_only"
     else:
         cache_mode_tag = "vanilla"
 
