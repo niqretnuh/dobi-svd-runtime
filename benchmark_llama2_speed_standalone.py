@@ -1,10 +1,13 @@
 import argparse
-import csv
 import json
 import math
 import os
 import random
+import re
+import shlex
+import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -417,6 +420,123 @@ def _apply_rope_to_q_standalone(q, cos, sin, position_ids):
     return q_embed
 
 
+def _apply_rope_to_k_standalone(k, cos, sin, position_ids):
+    cos, sin = _select_rope_positions(cos, sin, position_ids)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return k_embed
+
+
+def _get_llama_attn_dims(attn):
+    cfg = getattr(attn, "config", None)
+
+    num_heads = int(
+        getattr(attn, "num_heads", None)
+        or (cfg.num_attention_heads if cfg is not None else None)
+    )
+    num_kv_heads = int(
+        getattr(attn, "num_key_value_heads", None)
+        or (cfg.num_key_value_heads if cfg is not None else num_heads)
+    )
+    num_kv_groups = int(
+        getattr(attn, "num_key_value_groups", num_heads // num_kv_heads)
+    )
+    head_dim = int(
+        getattr(attn, "head_dim", None)
+        or (cfg.hidden_size // cfg.num_attention_heads if cfg is not None else None)
+    )
+
+    return num_heads, num_kv_heads, num_kv_groups, head_dim
+
+
+def _cache_seq_len(cache):
+    if cache is None:
+        return 0
+
+    if cache.dim() == 4:
+        return int(cache.shape[2])
+
+    if cache.dim() == 3:
+        return int(cache.shape[1])
+
+    raise RuntimeError(f"Unsupported cache shape: {tuple(cache.shape)}")
+
+
+def _dense_kv_attention_forward(
+    attn,
+    hidden_states,
+    position_ids,
+    attention_mask,
+    past_key,
+    past_value,
+    rotary_emb=None,
+):
+    bsz, q_len, _ = hidden_states.shape
+    device = hidden_states.device
+
+    num_heads, num_kv_heads, num_kv_groups, head_dim = _get_llama_attn_dims(attn)
+
+    query_states = attn.q_proj(hidden_states)
+    key_states = attn.k_proj(hidden_states)
+    value_states = attn.v_proj(hidden_states)
+
+    query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+
+    past_len = _cache_seq_len(past_key)
+    kv_seq_len = past_len + q_len
+
+    rope = rotary_emb if rotary_emb is not None else getattr(attn, "rotary_emb", None)
+    cos, sin = _get_rope_cos_sin(
+        rotary_emb=rope,
+        query_states=query_states,
+        position_ids=position_ids,
+        kv_seq_len=kv_seq_len,
+    )
+
+    query_states, key_states = _apply_rope_standalone(
+        query_states,
+        key_states,
+        cos,
+        sin,
+        position_ids,
+    )
+
+    if past_key is not None:
+        key_cache = torch.cat([past_key, key_states], dim=2)
+        value_cache = torch.cat([past_value, value_states], dim=2)
+    else:
+        key_cache = key_states
+        value_cache = value_states
+
+    key_for_scores = _repeat_kv(key_cache, num_kv_groups)
+    value_for_context = _repeat_kv(value_cache, num_kv_groups)
+
+    attn_scores = torch.matmul(query_states, key_for_scores.transpose(2, 3))
+    attn_scores = attn_scores / math.sqrt(head_dim)
+
+    key_positions = torch.arange(kv_seq_len, device=device).view(1, 1, 1, kv_seq_len)
+    query_positions = position_ids.view(bsz, 1, q_len, 1)
+    causal_mask = key_positions <= query_positions
+    attn_scores = attn_scores.masked_fill(~causal_mask, torch.finfo(attn_scores.dtype).min)
+
+    if attention_mask is not None:
+        key_padding_mask = attention_mask[:, None, None, :kv_seq_len].to(torch.bool)
+        attn_scores = attn_scores.masked_fill(
+            ~key_padding_mask,
+            torch.finfo(attn_scores.dtype).min,
+        )
+
+    attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(query_states.dtype)
+
+    attn_output = torch.matmul(attn_probs, value_for_context)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, num_heads * head_dim)
+    attn_output = attn.o_proj(attn_output)
+
+    return attn_output, key_cache, value_cache
+
+
 def _apply_inverse_rope_for_key_positions(q_rope, cos, sin, key_position_ids):
     """
     Applies R_j^T to a RoPE-rotated query for a chunk of key positions.
@@ -506,44 +626,42 @@ def _validate_lowrank_v_cache_model(model):
     if not hasattr(model, "model") or not hasattr(model.model, "layers"):
         raise RuntimeError("--lowrank_v_cache currently expects a LLaMA-style model.")
 
-    n_checked = 0
+    n_layers = 0
+    n_lowrank_v = 0
     for layer in model.model.layers:
         attn = layer.self_attn
-        if not isinstance(attn.v_proj, LowRankLinear):
-            raise RuntimeError(
-                "--lowrank_v_cache requires every self_attn.v_proj to be LowRankLinear. "
-                "Use --model_kind lowrank with a checkpoint whose v_proj modules were "
-                "low-rank decomposed."
-            )
-        n_checked += 1
+        n_layers += 1
+        n_lowrank_v += int(_is_lowrank_module(attn.v_proj))
 
-    print(f"[lowrank-v-cache] validated {n_checked} attention layers")
+    print(
+        f"[lowrank-v-cache] low-rank v_proj layers: "
+        f"{n_lowrank_v}/{n_layers}; dense v_proj layers use full V cache"
+    )
 
 
 def _validate_lowrank_kv_cache_model(model):
     if not hasattr(model, "model") or not hasattr(model.model, "layers"):
         raise RuntimeError("--lowrank_k_cache currently expects a LLaMA-style model.")
 
-    n_checked = 0
+    n_layers = 0
+    n_lowrank_k = 0
+    n_lowrank_v = 0
+
     for layer in model.model.layers:
         attn = layer.self_attn
 
-        if not isinstance(attn.k_proj, LowRankLinear):
-            raise RuntimeError(
-                "--lowrank_k_cache requires every self_attn.k_proj to be LowRankLinear. "
-                "Use --model_kind lowrank with a checkpoint whose k_proj modules were "
-                "low-rank decomposed."
-            )
+        n_layers += 1
+        n_lowrank_k += int(_is_lowrank_module(attn.k_proj))
+        n_lowrank_v += int(_is_lowrank_module(attn.v_proj))
 
-        if not isinstance(attn.v_proj, LowRankLinear):
-            raise RuntimeError(
-                "--lowrank_k_cache also requires every self_attn.v_proj to be LowRankLinear, "
-                "because this path uses compressed K and compressed V together."
-            )
-
-        n_checked += 1
-
-    print(f"[lowrank-kv-cache] validated {n_checked} attention layers")
+    print(
+        f"[lowrank-kv-cache] low-rank k_proj layers: "
+        f"{n_lowrank_k}/{n_layers}; dense k_proj layers use full K cache"
+    )
+    print(
+        f"[lowrank-kv-cache] low-rank v_proj layers: "
+        f"{n_lowrank_v}/{n_layers}; dense v_proj layers use full V cache"
+    )
 
 
 def _lowrank_v_attention_forward(
@@ -566,28 +684,21 @@ def _lowrank_v_attention_forward(
 
     This is exact for the low-rank model when v_proj = u_proj(v_proj(x)).
     """
-    if not isinstance(attn.v_proj, LowRankLinear):
-        raise RuntimeError("Expected attn.v_proj to be LowRankLinear.")
+    if not _is_lowrank_module(attn.v_proj):
+        return _dense_kv_attention_forward(
+            attn=attn,
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key=past_key,
+            past_value=past_z_value,
+            rotary_emb=rotary_emb,
+        )
 
     bsz, q_len, _ = hidden_states.shape
     device = hidden_states.device
 
-    cfg = getattr(attn, "config", None)
-    num_heads = int(
-        getattr(attn, "num_heads", None)
-        or (cfg.num_attention_heads if cfg is not None else None)
-    )
-    num_kv_heads = int(
-        getattr(attn, "num_key_value_heads", None)
-        or (cfg.num_key_value_heads if cfg is not None else num_heads)
-    )
-    num_kv_groups = int(
-        getattr(attn, "num_key_value_groups", num_heads // num_kv_heads)
-    )
-    head_dim = int(
-        getattr(attn, "head_dim", None)
-        or (cfg.hidden_size // cfg.num_attention_heads if cfg is not None else None)
-    )
+    num_heads, num_kv_heads, num_kv_groups, head_dim = _get_llama_attn_dims(attn)
 
     query_states = attn.q_proj(hidden_states)
     key_states = attn.k_proj(hidden_states)
@@ -697,39 +808,32 @@ def _lowrank_kv_attention_forward(
 
     so the persistent K cache stays low-rank.
     """
-    if not isinstance(attn.k_proj, LowRankLinear):
-        raise RuntimeError("Expected attn.k_proj to be LowRankLinear.")
-    if not isinstance(attn.v_proj, LowRankLinear):
-        raise RuntimeError("Expected attn.v_proj to be LowRankLinear.")
+    k_is_lowrank = _is_lowrank_module(attn.k_proj)
+    v_is_lowrank = _is_lowrank_module(attn.v_proj)
+
+    if not k_is_lowrank and not v_is_lowrank:
+        return _dense_kv_attention_forward(
+            attn=attn,
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key=past_z_key,
+            past_value=past_z_value,
+            rotary_emb=rotary_emb,
+        )
+
+    if (past_z_key is None) != (past_z_value is None):
+        raise RuntimeError("K and V caches must either both be None or both be present.")
 
     bsz, q_len, _ = hidden_states.shape
     device = hidden_states.device
 
-    cfg = getattr(attn, "config", None)
-    num_heads = int(
-        getattr(attn, "num_heads", None)
-        or (cfg.num_attention_heads if cfg is not None else None)
-    )
-    num_kv_heads = int(
-        getattr(attn, "num_key_value_heads", None)
-        or (cfg.num_key_value_heads if cfg is not None else num_heads)
-    )
-    num_kv_groups = int(
-        getattr(attn, "num_key_value_groups", num_heads // num_kv_heads)
-    )
-    head_dim = int(
-        getattr(attn, "head_dim", None)
-        or (cfg.hidden_size // cfg.num_attention_heads if cfg is not None else None)
-    )
+    num_heads, num_kv_heads, num_kv_groups, head_dim = _get_llama_attn_dims(attn)
 
     query_states = attn.q_proj(hidden_states)
     query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
 
-    # Low-rank K and V coefficients.
-    z_key_states = attn.k_proj.v_proj(hidden_states)
-    z_value_states = attn.v_proj.v_proj(hidden_states)
-
-    past_len = 0 if past_z_key is None else past_z_key.shape[1]
+    past_len = _cache_seq_len(past_z_key)
     kv_seq_len = past_len + q_len
 
     rope = rotary_emb if rotary_emb is not None else getattr(attn, "rotary_emb", None)
@@ -740,43 +844,78 @@ def _lowrank_kv_attention_forward(
         kv_seq_len=kv_seq_len,
     )
 
-    query_states = _apply_rope_to_q_standalone(
-        query_states,
-        cos,
-        sin,
-        position_ids,
-    )
-
-    if past_z_key is not None:
-        z_key_cache = torch.cat([past_z_key, z_key_states], dim=1)
-        z_value_cache = torch.cat([past_z_value, z_value_states], dim=1)
-    else:
-        z_key_cache = z_key_states
-        z_value_cache = z_value_states
-
-    # Build per-query-head U_k blocks.
-    k_u_weight = attn.k_proj.u_proj.weight
-    rank_k = int(attn.k_proj.rank)
-    expected_k_out = num_kv_heads * head_dim
-
-    if k_u_weight.shape[0] != expected_k_out:
-        raise RuntimeError(
-            f"Unexpected k_proj.u_proj output dimension: got {k_u_weight.shape[0]}, "
-            f"expected {expected_k_out} = num_kv_heads({num_kv_heads}) * head_dim({head_dim})."
+    # K path. If k_proj is low-rank, store [batch, seq, rank_k].
+    # Otherwise store full K as [batch, num_kv_heads, seq, head_dim].
+    if k_is_lowrank:
+        query_states = _apply_rope_to_q_standalone(
+            query_states,
+            cos,
+            sin,
+            position_ids,
         )
 
-    k_u_blocks = k_u_weight.view(num_kv_heads, head_dim, rank_k)
-    kv_head_for_query_head = torch.arange(num_heads, device=device) // num_kv_groups
-    k_u_for_heads = k_u_blocks[kv_head_for_query_head]
+        z_key_states = attn.k_proj.v_proj(hidden_states)
+        if past_z_key is not None:
+            key_cache_out = torch.cat([past_z_key, z_key_states], dim=1)
+        else:
+            key_cache_out = z_key_states
+    else:
+        key_states = attn.k_proj(hidden_states)
+        key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
 
-    if past_z_key is None:
+        query_states, key_states = _apply_rope_standalone(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            position_ids,
+        )
+
+        if past_z_key is not None:
+            key_cache_out = torch.cat([past_z_key, key_states], dim=2)
+        else:
+            key_cache_out = key_states
+
+    # V path. If v_proj is low-rank, store [batch, seq, rank_v].
+    # Otherwise store full V as [batch, num_kv_heads, seq, head_dim].
+    if v_is_lowrank:
+        z_value_states = attn.v_proj.v_proj(hidden_states)
+        if past_z_value is not None:
+            value_cache_out = torch.cat([past_z_value, z_value_states], dim=1)
+        else:
+            value_cache_out = z_value_states
+    else:
+        value_states = attn.v_proj(hidden_states)
+        value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+
+        if past_z_value is not None:
+            value_cache_out = torch.cat([past_z_value, value_states], dim=2)
+        else:
+            value_cache_out = value_states
+
+    kv_head_for_query_head = torch.arange(num_heads, device=device) // num_kv_groups
+
+    if k_is_lowrank:
+        k_u_weight = attn.k_proj.u_proj.weight
+        rank_k = int(attn.k_proj.rank)
+        expected_k_out = num_kv_heads * head_dim
+
+        if k_u_weight.shape[0] != expected_k_out:
+            raise RuntimeError(
+                f"Unexpected k_proj.u_proj output dimension: got {k_u_weight.shape[0]}, "
+                f"expected {expected_k_out} = num_kv_heads({num_kv_heads}) * head_dim({head_dim})."
+            )
+
+        k_u_blocks = k_u_weight.view(num_kv_heads, head_dim, rank_k)
+        k_u_for_heads = k_u_blocks[kv_head_for_query_head]
+
+    if k_is_lowrank and past_z_key is None:
         # Prefill path: reconstruct K only inside this layer for the prompt pass.
-        # The persistent cache still stores z_key_cache, not full K.
+        # The persistent cache still stores low-rank K coefficients.
         key_states = attn.k_proj.u_proj(z_key_states)
         key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
 
-        _, key_states = _apply_rope_standalone(
-            query_states,
+        key_states = _apply_rope_to_k_standalone(
             key_states,
             cos,
             sin,
@@ -786,17 +925,21 @@ def _lowrank_kv_attention_forward(
         key_for_scores = _repeat_kv(key_states, num_kv_groups)
         attn_scores = torch.matmul(query_states, key_for_scores.transpose(2, 3))
         attn_scores = attn_scores / math.sqrt(head_dim)
-    else:
+    elif k_is_lowrank:
         # Decode path: compute scores from compressed K without reconstruction.
         attn_scores = _lowrank_k_scores_from_compressed_cache(
             q_rope=query_states,
-            z_key_cache=z_key_cache,
+            z_key_cache=key_cache_out,
             u_for_heads=k_u_for_heads,
             cos=cos,
             sin=sin,
             head_dim=head_dim,
             chunk_size=k_score_chunk_size,
         )
+    else:
+        key_for_scores = _repeat_kv(key_cache_out, num_kv_groups)
+        attn_scores = torch.matmul(query_states, key_for_scores.transpose(2, 3))
+        attn_scores = attn_scores / math.sqrt(head_dim)
 
     key_positions = torch.arange(kv_seq_len, device=device).view(1, 1, 1, kv_seq_len)
     query_positions = position_ids.view(bsz, 1, q_len, 1)
@@ -812,34 +955,37 @@ def _lowrank_kv_attention_forward(
 
     attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(query_states.dtype)
 
-    # Compressed V aggregation, same shape as the V-cache path.
-    z_context = torch.einsum("bhqs,bsr->bhqr", attn_probs, z_value_cache)
+    if v_is_lowrank:
+        z_context = torch.einsum("bhqs,bsr->bhqr", attn_probs, value_cache_out)
 
-    v_u_weight = attn.v_proj.u_proj.weight
-    rank_v = int(attn.v_proj.rank)
-    expected_v_out = num_kv_heads * head_dim
+        v_u_weight = attn.v_proj.u_proj.weight
+        rank_v = int(attn.v_proj.rank)
+        expected_v_out = num_kv_heads * head_dim
 
-    if v_u_weight.shape[0] != expected_v_out:
-        raise RuntimeError(
-            f"Unexpected v_proj.u_proj output dimension: got {v_u_weight.shape[0]}, "
-            f"expected {expected_v_out} = num_kv_heads({num_kv_heads}) * head_dim({head_dim})."
-        )
+        if v_u_weight.shape[0] != expected_v_out:
+            raise RuntimeError(
+                f"Unexpected v_proj.u_proj output dimension: got {v_u_weight.shape[0]}, "
+                f"expected {expected_v_out} = num_kv_heads({num_kv_heads}) * head_dim({head_dim})."
+            )
 
-    v_u_blocks = v_u_weight.view(num_kv_heads, head_dim, rank_v)
-    v_u_for_heads = v_u_blocks[kv_head_for_query_head]
+        v_u_blocks = v_u_weight.view(num_kv_heads, head_dim, rank_v)
+        v_u_for_heads = v_u_blocks[kv_head_for_query_head]
 
-    attn_output = torch.einsum("bhqr,hdr->bhqd", z_context, v_u_for_heads)
+        attn_output = torch.einsum("bhqr,hdr->bhqd", z_context, v_u_for_heads)
 
-    if attn.v_proj.u_proj.bias is not None:
-        bias_blocks = attn.v_proj.u_proj.bias.view(num_kv_heads, head_dim)
-        bias_for_heads = bias_blocks[kv_head_for_query_head]
-        attn_output = attn_output + bias_for_heads.view(1, num_heads, 1, head_dim)
+        if attn.v_proj.u_proj.bias is not None:
+            bias_blocks = attn.v_proj.u_proj.bias.view(num_kv_heads, head_dim)
+            bias_for_heads = bias_blocks[kv_head_for_query_head]
+            attn_output = attn_output + bias_for_heads.view(1, num_heads, 1, head_dim)
+    else:
+        value_for_context = _repeat_kv(value_cache_out, num_kv_groups)
+        attn_output = torch.matmul(attn_probs, value_for_context)
 
     attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(bsz, q_len, num_heads * head_dim)
     attn_output = attn.o_proj(attn_output)
 
-    return attn_output, z_key_cache, z_value_cache
+    return attn_output, key_cache_out, value_cache_out
 
 
 @torch.inference_mode()
@@ -860,7 +1006,7 @@ def lowrank_v_cache_forward(model, input_ids, attention_mask, past_layer_caches=
 
     past_len = 0
     if past_layer_caches is not None and past_layer_caches[0] is not None:
-        past_len = past_layer_caches[0][0].shape[2]
+        past_len = _cache_seq_len(past_layer_caches[0][0])
 
     position_ids = torch.arange(
         past_len,
@@ -966,7 +1112,7 @@ def lowrank_kv_cache_forward(
 
     past_len = 0
     if past_layer_caches is not None and past_layer_caches[0] is not None:
-        past_len = past_layer_caches[0][0].shape[1]
+        past_len = _cache_seq_len(past_layer_caches[0][0])
 
     position_ids = torch.arange(
         past_len,
@@ -1289,15 +1435,49 @@ def benchmark_generate_lowrank_kv_cache(
     return summary, rows
 
 
-def append_csv(path, row):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    exists = os.path.exists(path)
+def slugify(s: str) -> str:
+    return s.replace("/", "_").replace(" ", "_").strip("_") or "unknown"
 
-    with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row)
+
+_GPR_PATTERNS = [
+    r"gpr(\d+p\d+)",
+    r"gpr(\d+\.\d+)",
+    r"prune_rate_(\d+\.\d+)",
+    r"prune_rate_(\d+p\d+)",
+    r"pr(\d+p\d+)",
+    r"pr(\d+\.\d+)",
+]
+
+
+def infer_gpr_tag(*candidates: str) -> str:
+    for s in candidates:
+        if not s:
+            continue
+        for pat in _GPR_PATTERNS:
+            m = re.search(pat, s)
+            if m:
+                return m.group(1).replace(".", "p")
+    return ""
+
+
+def build_auto_label(model_kind: str, gpr_tag: str, prompt_len: int, gen_len: int, batch_size: int) -> str:
+    parts = [model_kind]
+    if gpr_tag:
+        parts.append(gpr_tag)
+    parts.extend([f"p{prompt_len}", f"g{gen_len}", f"b{batch_size}"])
+    return "_".join(parts)
+
+
+def build_run_filename(label: str, cache_mode: str, timestamp: str) -> str:
+    return f"{slugify(label)}_{cache_mode}_{timestamp}.json"
+
+
+def write_run_json(out_dir: str, filename: str, payload: dict) -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, filename)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, default=str)
+    return path
 
 
 # ---------------------------------------------------------------------
@@ -1325,7 +1505,7 @@ def main():
     ap.add_argument("--skip_export", action="store_true")
 
     # Benchmark metadata
-    ap.add_argument("--label", required=True)
+    ap.add_argument("--label", default="", help="Optional label override. If empty, auto-derived as e.g. lowrank_0p6_p1024_g1024_b1.")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", choices=["fp16", "bf16"], default="fp16")
     ap.add_argument("--seed", type=int, default=0)
@@ -1365,11 +1545,24 @@ def main():
 
     # Output
     ap.add_argument(
-        "--out_csv",
-        default="/home/qinh3/attention-aware-svdllm/clean_bench/results/export_benchmark_results.csv",
+        "--out_dir",
+        default="./results",
+        help="Directory to write the per-run timestamped JSON file.",
     )
 
     args = ap.parse_args()
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_command = " ".join(shlex.quote(a) for a in sys.argv)
+
+    gpr_tag = infer_gpr_tag(args.pt_path, args.export_dir) if args.model_kind == "lowrank" else ""
+    label = args.label or build_auto_label(
+        model_kind=args.model_kind,
+        gpr_tag=gpr_tag,
+        prompt_len=args.prompt_len,
+        gen_len=args.gen_len,
+        batch_size=args.batch_size,
+    )
+
     set_seed(args.seed)
 
     device = torch.device(args.device)
@@ -1394,7 +1587,7 @@ def main():
     print(f"[preflight] CUDA free={free / 2**30:.2f} GB / total={total / 2**30:.2f} GB")
 
     print("=" * 80)
-    print("label:", args.label)
+    print("label:", label)
     print("model_kind:", args.model_kind)
     print("dense_model:", args.dense_model)
     print("pt_path:", args.pt_path)
@@ -1431,10 +1624,12 @@ def main():
     # 2. Load model
     if args.model_kind == "dense":
         model, tokenizer = load_dense_model(args.dense_model, dtype=dtype, device=device)
-        model_path_for_csv = args.dense_model
+        model_path = args.dense_model
+        model_id = os.path.basename(args.dense_model.rstrip("/"))
     else:
         model, tokenizer = load_lowrank_model(args.export_dir, dtype=dtype, device=device)
-        model_path_for_csv = args.export_dir
+        model_path = args.export_dir
+        model_id = os.path.basename(args.export_dir.rstrip("/"))
 
     # 3. Optional compile
     if args.compile:
@@ -1487,17 +1682,27 @@ def main():
         )
         kv_cache_impl = "hf_generate_default"
 
+    if args.lowrank_k_cache:
+        cache_mode_tag = "kv_both"
+    elif args.lowrank_v_cache:
+        cache_mode_tag = "v_only"
+    else:
+        cache_mode_tag = "vanilla"
+
     result_row = {
-        "label": args.label,
+        "label": label,
+        "model_id": model_id,
+        "gpr": gpr_tag,
+        "cache_mode": cache_mode_tag,
+        "kv_cache_impl": kv_cache_impl,
         "model_kind": args.model_kind,
-        "model_path": model_path_for_csv,
+        "model_path": model_path,
         "pt_path": args.pt_path,
         "device_name": torch.cuda.get_device_name(device),
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "dtype": args.dtype,
         "compile": args.compile,
-        "kv_cache_impl": kv_cache_impl,
         "k_score_chunk_size": args.k_score_chunk_size if args.lowrank_k_cache else "",
         "prompt_len": args.prompt_len,
         "gen_len": args.gen_len,
@@ -1507,31 +1712,28 @@ def main():
         **summary,
     }
 
-    append_csv(args.out_csv, result_row)
+    payload = {
+        "timestamp": run_timestamp,
+        "command": run_command,
+        "argv": sys.argv,
+        "args": vars(args),
+        "summary": result_row,
+        "per_batch": batch_rows,
+    }
 
-    batch_csv = args.out_csv.replace(".csv", "_per_batch.csv")
-    for br in batch_rows:
-        append_csv(
-            batch_csv,
-            {
-                "label": args.label,
-                "compile": args.compile,
-                "kv_cache_impl": kv_cache_impl,
-                "k_score_chunk_size": args.k_score_chunk_size if args.lowrank_k_cache else "",
-                "prompt_len": args.prompt_len,
-                "gen_len": args.gen_len,
-                "batch_size": args.batch_size,
-                **br,
-            },
-        )
+    filename = build_run_filename(
+        label=label,
+        cache_mode=cache_mode_tag,
+        timestamp=run_timestamp,
+    )
+    out_path = write_run_json(args.out_dir, filename, payload)
 
     print("\nSUMMARY")
     for k, v in result_row.items():
         print(f"{k}: {v}")
 
     print("\nwrote:")
-    print(args.out_csv)
-    print(batch_csv)
+    print(out_path)
 
 
 if __name__ == "__main__":
