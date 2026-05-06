@@ -1333,6 +1333,335 @@ def lowrank_v_cache_generate_prealloc(model, input_ids, attention_mask, max_new_
     return generated[:, :prompt_len + max_new_tokens]
 
 
+def _allocate_lowrank_kv_cache(model, batch_size: int, max_seq_len: int, device, dtype):
+    """
+    Preallocates per-layer K and V caches for the compressed K+V path.
+
+    Per-layer dict:
+        "k_lowrank": bool
+        "v_lowrank": bool
+        "k_z" / "k": compressed or full K buffer
+        "v_z" / "v": compressed or full V buffer
+    """
+    caches = []
+
+    for layer in model.model.layers:
+        attn = layer.self_attn
+        num_heads, num_kv_heads, num_kv_groups, head_dim = _get_llama_attn_dims(attn)
+
+        k_lowrank = _is_lowrank_module(attn.k_proj)
+        v_lowrank = _is_lowrank_module(attn.v_proj)
+
+        if k_lowrank:
+            rank_k = int(attn.k_proj.rank)
+            k_z_buf = torch.empty(batch_size, max_seq_len, rank_k, device=device, dtype=dtype)
+            k_buf = None
+        else:
+            k_z_buf = None
+            k_buf = torch.empty(
+                batch_size, num_kv_heads, max_seq_len, head_dim,
+                device=device, dtype=dtype,
+            )
+
+        if v_lowrank:
+            rank_v = int(attn.v_proj.rank)
+            v_z_buf = torch.empty(batch_size, max_seq_len, rank_v, device=device, dtype=dtype)
+            v_buf = None
+        else:
+            v_z_buf = None
+            v_buf = torch.empty(
+                batch_size, num_kv_heads, max_seq_len, head_dim,
+                device=device, dtype=dtype,
+            )
+
+        caches.append({
+            "k_lowrank": k_lowrank,
+            "v_lowrank": v_lowrank,
+            "k_z": k_z_buf,
+            "k": k_buf,
+            "v_z": v_z_buf,
+            "v": v_buf,
+        })
+
+    return caches
+
+
+def _lowrank_kv_attention_forward_inplace(
+    attn,
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask_full: torch.Tensor,
+    layer_cache: dict,
+    write_pos: int,
+    kv_seq_len: int,
+    rotary_emb=None,
+    k_score_chunk_size: int = 256,
+):
+    """
+    Compressed K+V attention with preallocated cache. Writes new K/V or
+    z_K/z_V into layer_cache at [write_pos : write_pos + q_len] and reads
+    the prefix [: kv_seq_len].
+    """
+    bsz, q_len, _ = hidden_states.shape
+    device = hidden_states.device
+
+    num_heads, num_kv_heads, num_kv_groups, head_dim = _get_llama_attn_dims(attn)
+
+    k_is_lowrank = layer_cache["k_lowrank"]
+    v_is_lowrank = layer_cache["v_lowrank"]
+
+    query_states = attn.q_proj(hidden_states)
+    query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+
+    rope = rotary_emb if rotary_emb is not None else getattr(attn, "rotary_emb", None)
+    cos, sin = _get_rope_cos_sin(
+        rotary_emb=rope,
+        query_states=query_states,
+        position_ids=position_ids,
+        kv_seq_len=kv_seq_len,
+    )
+
+    # K write path
+    if k_is_lowrank:
+        query_states = _apply_rope_to_q_standalone(query_states, cos, sin, position_ids)
+
+        z_key_states = attn.k_proj.v_proj(hidden_states)
+        layer_cache["k_z"][:, write_pos:write_pos + q_len, :] = z_key_states
+
+        k_u_weight = attn.k_proj.u_proj.weight
+        rank_k = int(attn.k_proj.rank)
+        expected_k_out = num_kv_heads * head_dim
+
+        if k_u_weight.shape[0] != expected_k_out:
+            raise RuntimeError(
+                f"Unexpected k_proj.u_proj output dimension: got {k_u_weight.shape[0]}, "
+                f"expected {expected_k_out} = num_kv_heads({num_kv_heads}) * head_dim({head_dim})."
+            )
+
+        k_u_blocks = k_u_weight.view(num_kv_heads, head_dim, rank_k)
+        kv_head_for_query_head = torch.arange(num_heads, device=device) // num_kv_groups
+        k_u_for_heads = k_u_blocks[kv_head_for_query_head]
+    else:
+        key_states = attn.k_proj(hidden_states)
+        key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+
+        query_states, key_states = _apply_rope_standalone(
+            query_states, key_states, cos, sin, position_ids,
+        )
+
+        layer_cache["k"][:, :, write_pos:write_pos + q_len, :] = key_states
+
+    # V write path
+    if v_is_lowrank:
+        z_value_states = attn.v_proj.v_proj(hidden_states)
+        layer_cache["v_z"][:, write_pos:write_pos + q_len, :] = z_value_states
+    else:
+        value_states = attn.v_proj(hidden_states)
+        value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+        layer_cache["v"][:, :, write_pos:write_pos + q_len, :] = value_states
+
+    kv_head_for_query_head = torch.arange(num_heads, device=device) // num_kv_groups
+
+    # Score path
+    if k_is_lowrank and write_pos == 0 and q_len == kv_seq_len:
+        # Prefill: reconstruct only current prompt K, persistent cache stays compressed.
+        key_states = attn.k_proj.u_proj(z_key_states)
+        key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+
+        key_states = _apply_rope_to_k_standalone(key_states, cos, sin, position_ids)
+
+        key_for_scores = _repeat_kv(key_states, num_kv_groups)
+        attn_scores = torch.matmul(query_states, key_for_scores.transpose(2, 3))
+        attn_scores = attn_scores / math.sqrt(head_dim)
+    elif k_is_lowrank:
+        # Decode: score directly from compressed K prefix.
+        z_key_prefix = layer_cache["k_z"][:, :kv_seq_len, :]
+
+        attn_scores = _lowrank_k_scores_from_compressed_cache(
+            q_rope=query_states,
+            z_key_cache=z_key_prefix,
+            u_for_heads=k_u_for_heads,
+            cos=cos,
+            sin=sin,
+            head_dim=head_dim,
+            chunk_size=k_score_chunk_size,
+        )
+    else:
+        key_prefix = layer_cache["k"][:, :, :kv_seq_len, :]
+        key_for_scores = _repeat_kv(key_prefix, num_kv_groups)
+
+        attn_scores = torch.matmul(query_states, key_for_scores.transpose(2, 3))
+        attn_scores = attn_scores / math.sqrt(head_dim)
+
+    key_positions = torch.arange(kv_seq_len, device=device).view(1, 1, 1, kv_seq_len)
+    query_positions = position_ids.view(bsz, 1, q_len, 1)
+    causal_mask = key_positions <= query_positions
+    attn_scores = attn_scores.masked_fill(~causal_mask, torch.finfo(attn_scores.dtype).min)
+
+    if attention_mask_full is not None:
+        key_padding_mask = attention_mask_full[:, None, None, :kv_seq_len].to(torch.bool)
+        attn_scores = attn_scores.masked_fill(
+            ~key_padding_mask,
+            torch.finfo(attn_scores.dtype).min,
+        )
+
+    attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(query_states.dtype)
+
+    # Value aggregation
+    if v_is_lowrank:
+        z_value_prefix = layer_cache["v_z"][:, :kv_seq_len, :]
+        z_context = torch.einsum("bhqs,bsr->bhqr", attn_probs, z_value_prefix)
+
+        v_u_weight = attn.v_proj.u_proj.weight
+        rank_v = int(attn.v_proj.rank)
+        expected_v_out = num_kv_heads * head_dim
+
+        if v_u_weight.shape[0] != expected_v_out:
+            raise RuntimeError(
+                f"Unexpected v_proj.u_proj output dimension: got {v_u_weight.shape[0]}, "
+                f"expected {expected_v_out} = num_kv_heads({num_kv_heads}) * head_dim({head_dim})."
+            )
+
+        v_u_blocks = v_u_weight.view(num_kv_heads, head_dim, rank_v)
+        v_u_for_heads = v_u_blocks[kv_head_for_query_head]
+
+        attn_output = torch.einsum("bhqr,hdr->bhqd", z_context, v_u_for_heads)
+
+        if attn.v_proj.u_proj.bias is not None:
+            bias_blocks = attn.v_proj.u_proj.bias.view(num_kv_heads, head_dim)
+            bias_for_heads = bias_blocks[kv_head_for_query_head]
+            attn_output = attn_output + bias_for_heads.view(1, num_heads, 1, head_dim)
+    else:
+        value_prefix = layer_cache["v"][:, :, :kv_seq_len, :]
+        value_for_context = _repeat_kv(value_prefix, num_kv_groups)
+        attn_output = torch.matmul(attn_probs, value_for_context)
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, num_heads * head_dim)
+    attn_output = attn.o_proj(attn_output)
+
+    return attn_output
+
+
+@torch.inference_mode()
+def lowrank_kv_cache_forward_inplace(
+    model,
+    input_ids,
+    attention_mask_full,
+    layer_caches,
+    write_pos: int,
+    kv_seq_len: int,
+    k_score_chunk_size: int = 256,
+):
+    decoder = model.model
+    bsz, q_len = input_ids.shape
+    device = input_ids.device
+    decoder_rotary_emb = getattr(decoder, "rotary_emb", None)
+
+    position_ids = torch.arange(
+        write_pos, kv_seq_len, device=device, dtype=torch.long,
+    ).unsqueeze(0).expand(bsz, -1)
+
+    hidden_states = decoder.embed_tokens(input_ids)
+
+    for layer_idx, decoder_layer in enumerate(decoder.layers):
+        residual = hidden_states
+        hidden_states_norm = decoder_layer.input_layernorm(hidden_states)
+
+        attn_output = _lowrank_kv_attention_forward_inplace(
+            attn=decoder_layer.self_attn,
+            hidden_states=hidden_states_norm,
+            position_ids=position_ids,
+            attention_mask_full=attention_mask_full,
+            layer_cache=layer_caches[layer_idx],
+            write_pos=write_pos,
+            kv_seq_len=kv_seq_len,
+            rotary_emb=decoder_rotary_emb,
+            k_score_chunk_size=k_score_chunk_size,
+        )
+
+        hidden_states = residual + attn_output
+
+        residual = hidden_states
+        hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
+        hidden_states = decoder_layer.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+    hidden_states = decoder.norm(hidden_states)
+    logits = model.lm_head(hidden_states)
+    return logits
+
+
+@torch.inference_mode()
+def lowrank_kv_cache_generate_prealloc(
+    model,
+    input_ids,
+    attention_mask,
+    max_new_tokens,
+    k_score_chunk_size: int = 256,
+):
+    """
+    Greedy generation using preallocated compressed K+V cache.
+    """
+    bsz, prompt_len = input_ids.shape
+    device = input_ids.device
+    max_seq = prompt_len + max_new_tokens
+
+    sample_attn = model.model.layers[0].self_attn
+    weight_for_dtype = (
+        sample_attn.q_proj.weight
+        if isinstance(sample_attn.q_proj, nn.Linear)
+        else sample_attn.q_proj.u_proj.weight
+    )
+    cache_dtype = weight_for_dtype.dtype
+
+    layer_caches = _allocate_lowrank_kv_cache(
+        model=model,
+        batch_size=bsz,
+        max_seq_len=max_seq,
+        device=device,
+        dtype=cache_dtype,
+    )
+
+    attention_mask_full = torch.ones(bsz, max_seq, device=device, dtype=attention_mask.dtype)
+    attention_mask_full[:, :prompt_len] = attention_mask
+
+    generated = torch.empty(bsz, max_seq, device=device, dtype=input_ids.dtype)
+    generated[:, :prompt_len] = input_ids
+
+    logits = lowrank_kv_cache_forward_inplace(
+        model=model,
+        input_ids=input_ids,
+        attention_mask_full=attention_mask_full,
+        layer_caches=layer_caches,
+        write_pos=0,
+        kv_seq_len=prompt_len,
+        k_score_chunk_size=k_score_chunk_size,
+    )
+
+    cur_pos = prompt_len
+
+    for gen_idx in range(max_new_tokens):
+        next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+        generated[:, cur_pos:cur_pos + 1] = next_token
+
+        if gen_idx + 1 >= max_new_tokens:
+            break
+
+        logits = lowrank_kv_cache_forward_inplace(
+            model=model,
+            input_ids=next_token,
+            attention_mask_full=attention_mask_full,
+            layer_caches=layer_caches,
+            write_pos=cur_pos,
+            kv_seq_len=cur_pos + 1,
+            k_score_chunk_size=k_score_chunk_size,
+        )
+        cur_pos += 1
+
+    return generated[:, :prompt_len + max_new_tokens]
+
+
 @torch.inference_mode()
 def lowrank_kv_cache_forward(
     model,
@@ -1615,11 +1944,18 @@ def benchmark_generate_lowrank_kv_cache(
     num_batches,
     warmup,
     k_score_chunk_size: int = 256,
+    prealloc: bool = False,
 ):
     if device.type != "cuda":
         raise RuntimeError("This benchmark script expects CUDA.")
 
     _validate_lowrank_kv_cache_model(model)
+
+    if prealloc:
+        print("[lowrank-kv-cache] using preallocated cache path")
+        gen_fn = lowrank_kv_cache_generate_prealloc
+    else:
+        gen_fn = lowrank_kv_cache_generate
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
@@ -1638,7 +1974,7 @@ def benchmark_generate_lowrank_kv_cache(
         torch.cuda.synchronize(device)
         t0 = time.perf_counter()
 
-        _ = lowrank_kv_cache_generate(
+        _ = gen_fn(
             model=model,
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1745,7 +2081,16 @@ def main():
     )
 
     # Which model to run
-    ap.add_argument("--model_kind", choices=["dense", "lowrank"], required=True)
+    ap.add_argument(
+        "--model_kind",
+        choices=["dense", "lowrank", "auto"],
+        default="auto",
+        help=(
+            "auto (default): pick dense if --pt_path is empty, else lowrank. "
+            "dense: load --dense_model from HuggingFace. "
+            "lowrank: export from --pt_path then load."
+        ),
+    )
 
     # Dense path
     ap.add_argument("--dense_model", default="meta-llama/Llama-2-7b-hf")
@@ -1790,6 +2135,14 @@ def main():
         ),
     )
     ap.add_argument(
+        "--kvcache_prealloc",
+        action="store_true",
+        help=(
+            "Use preallocated K/V cache buffers for the compressed K+V path "
+            "(avoids torch.cat per decode step). Combine with --lowrank_k_cache."
+        ),
+    )
+    ap.add_argument(
         "--lowrank_k_cache",
         action="store_true",
         help=(
@@ -1814,6 +2167,15 @@ def main():
     args = ap.parse_args()
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_command = " ".join(shlex.quote(a) for a in sys.argv)
+
+    # Resolve auto model_kind: lowrank if a checkpoint is supplied, else dense.
+    if args.model_kind == "auto":
+        if args.pt_path or args.skip_export:
+            args.model_kind = "lowrank"
+            print(f"[model_kind] auto -> lowrank (pt_path={args.pt_path or '<skip_export>'})")
+        else:
+            args.model_kind = "dense"
+            print(f"[model_kind] auto -> dense ({args.dense_model})")
 
     gpr_tag = infer_gpr_tag(args.pt_path, args.export_dir) if args.model_kind == "lowrank" else ""
     label = args.label or build_auto_label(
@@ -1841,6 +2203,9 @@ def main():
     if args.vcache_prealloc and not args.lowrank_v_cache:
         raise ValueError("--vcache_prealloc requires --lowrank_v_cache")
 
+    if args.kvcache_prealloc and not args.lowrank_k_cache:
+        raise ValueError("--kvcache_prealloc requires --lowrank_k_cache")
+
     if args.lowrank_k_cache and args.lowrank_v_cache:
         raise ValueError("Use either --lowrank_v_cache or --lowrank_k_cache, not both.")
 
@@ -1863,6 +2228,7 @@ def main():
     print("gen_len:", args.gen_len)
     print("lowrank_v_cache:", args.lowrank_v_cache)
     print("vcache_prealloc:", args.vcache_prealloc)
+    print("kvcache_prealloc:", args.kvcache_prealloc)
     print("lowrank_k_cache:", args.lowrank_k_cache)
     print("k_score_chunk_size:", args.k_score_chunk_size)
     print("batch_size:", args.batch_size)
@@ -1876,6 +2242,16 @@ def main():
         if not args.skip_export:
             if not args.pt_path:
                 raise ValueError("--pt_path is required for lowrank export unless --skip_export is passed")
+
+            if os.path.isfile(args.pt_path):
+                size_gb = os.path.getsize(args.pt_path) / 2**30
+                print(f"[checkpoint] compressed.pt model FOUND")
+                print(f"[checkpoint] path: {os.path.abspath(args.pt_path)}")
+                print(f"[checkpoint] size: {size_gb:.2f} GB")
+            else:
+                raise FileNotFoundError(
+                    f"--pt_path does not exist: {args.pt_path}"
+                )
 
             export_lowrank_checkpoint(
                 pt_path=args.pt_path,
@@ -1922,8 +2298,13 @@ def main():
             num_batches=args.num_batches,
             warmup=args.warmup,
             k_score_chunk_size=args.k_score_chunk_size,
+            prealloc=args.kvcache_prealloc,
         )
-        kv_cache_impl = "lowrank_kv_cache_phase2"
+        kv_cache_impl = (
+            "lowrank_kv_cache_phase2_prealloc"
+            if args.kvcache_prealloc
+            else "lowrank_kv_cache_phase2"
+        )
     elif args.lowrank_v_cache:
         summary, batch_rows = benchmark_generate_lowrank_v_cache(
             model=model,
@@ -1953,7 +2334,7 @@ def main():
         kv_cache_impl = "hf_generate_default"
 
     if args.lowrank_k_cache:
-        cache_mode_tag = "kv_both"
+        cache_mode_tag = "kv_both_prealloc" if args.kvcache_prealloc else "kv_both"
     elif args.lowrank_v_cache:
         cache_mode_tag = "v_only_prealloc" if args.vcache_prealloc else "v_only"
     else:
@@ -1974,6 +2355,8 @@ def main():
         "dtype": args.dtype,
         "compile": args.compile,
         "k_score_chunk_size": args.k_score_chunk_size if args.lowrank_k_cache else "",
+        "vcache_prealloc": args.vcache_prealloc,
+        "kvcache_prealloc": args.kvcache_prealloc,
         "prompt_len": args.prompt_len,
         "gen_len": args.gen_len,
         "batch_size": args.batch_size,
