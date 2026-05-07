@@ -461,6 +461,182 @@ def _cache_seq_len(cache):
     raise RuntimeError(f"Unsupported cache shape: {tuple(cache.shape)}")
 
 
+def _bytes_to_gb(x) -> float:
+    return float(x) / float(2**30)
+
+
+def _unwrap_compiled_model(model):
+    """torch.compile wraps the original module under _orig_mod."""
+    return getattr(model, "_orig_mod", model)
+
+
+def _infer_cache_element_size(model) -> int:
+    """Returns bytes per cache element (cache dtype follows weight dtype)."""
+    model = _unwrap_compiled_model(model)
+
+    for p in model.parameters():
+        return p.element_size()
+
+    raise RuntimeError("Could not infer model/cache dtype because model has no parameters.")
+
+
+def _full_k_or_v_cache_bytes(
+    batch_size: int,
+    seq_len: int,
+    num_kv_heads: int,
+    head_dim: int,
+    elem_size: int,
+) -> int:
+    return int(batch_size) * int(seq_len) * int(num_kv_heads) * int(head_dim) * int(elem_size)
+
+
+def _lowrank_cache_bytes(
+    batch_size: int,
+    seq_len: int,
+    rank: int,
+    elem_size: int,
+) -> int:
+    return int(batch_size) * int(seq_len) * int(rank) * int(elem_size)
+
+
+def estimate_kv_cache_bytes(
+    model,
+    batch_size: int,
+    seq_len: int,
+    cache_kind: str,
+) -> int:
+    """
+    Estimates persistent KV-cache footprint for the selected cache mode.
+
+    cache_kind:
+        "hf_full"     full K + full V per layer
+        "lowrank_v"   full K, V compressed if v_proj is LowRankLinear else full V
+        "lowrank_kv"  K compressed if k_proj is LowRankLinear else full K
+                      V compressed if v_proj is LowRankLinear else full V
+
+    Returns the steady-state cache size at seq_len = prompt_len + gen_len.
+    Excludes attention scores, softmax, logits, torch.cat reallocation, and
+    allocator fragmentation; those land in other_runtime_mem_gb.
+    """
+    model = _unwrap_compiled_model(model)
+
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise RuntimeError("KV-cache memory estimation currently expects a LLaMA-style model.")
+
+    if cache_kind not in {"hf_full", "lowrank_v", "lowrank_kv"}:
+        raise ValueError(f"Unsupported cache_kind: {cache_kind}")
+
+    elem_size = _infer_cache_element_size(model)
+    total_bytes = 0
+
+    for layer in model.model.layers:
+        attn = layer.self_attn
+        _, num_kv_heads, _, head_dim = _get_llama_attn_dims(attn)
+
+        full_one_side = _full_k_or_v_cache_bytes(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            elem_size=elem_size,
+        )
+
+        if cache_kind == "hf_full":
+            total_bytes += full_one_side
+            total_bytes += full_one_side
+            continue
+
+        if cache_kind == "lowrank_v":
+            total_bytes += full_one_side
+            if _is_lowrank_module(attn.v_proj):
+                total_bytes += _lowrank_cache_bytes(
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    rank=int(attn.v_proj.rank),
+                    elem_size=elem_size,
+                )
+            else:
+                total_bytes += full_one_side
+            continue
+
+        if cache_kind == "lowrank_kv":
+            if _is_lowrank_module(attn.k_proj):
+                total_bytes += _lowrank_cache_bytes(
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    rank=int(attn.k_proj.rank),
+                    elem_size=elem_size,
+                )
+            else:
+                total_bytes += full_one_side
+
+            if _is_lowrank_module(attn.v_proj):
+                total_bytes += _lowrank_cache_bytes(
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    rank=int(attn.v_proj.rank),
+                    elem_size=elem_size,
+                )
+            else:
+                total_bytes += full_one_side
+
+    return int(total_bytes)
+
+
+def build_memory_breakdown_summary(
+    *,
+    model,
+    total_time: float,
+    total_new_tokens: int,
+    weight_mem_bytes: int,
+    peak_mem_bytes: int,
+    cache_batch_size: int,
+    cache_seq_len: int,
+    cache_kind: str,
+) -> dict:
+    """
+    Builds the summary with a fine-grained memory split:
+        weights / KV cache / other runtime memory.
+
+    activation_cache_mem_gb is preserved as alias for non-weight peak memory.
+    """
+    kv_cache_bytes = estimate_kv_cache_bytes(
+        model=model,
+        batch_size=cache_batch_size,
+        seq_len=cache_seq_len,
+        cache_kind=cache_kind,
+    )
+
+    non_weight_bytes = max(0, int(peak_mem_bytes) - int(weight_mem_bytes))
+    other_runtime_bytes_raw = int(peak_mem_bytes) - int(weight_mem_bytes) - int(kv_cache_bytes)
+    other_runtime_bytes = max(0, other_runtime_bytes_raw)
+
+    return {
+        "throughput_new_tokens_per_sec": total_new_tokens / total_time,
+        "total_measured_seconds": total_time,
+        "total_new_tokens": total_new_tokens,
+
+        "weight_mem_gb": _bytes_to_gb(weight_mem_bytes),
+        "peak_mem_gb": _bytes_to_gb(peak_mem_bytes),
+        "activation_cache_mem_gb": _bytes_to_gb(non_weight_bytes),
+
+        "non_weight_runtime_mem_gb": _bytes_to_gb(non_weight_bytes),
+        "kv_cache_mem_gb": _bytes_to_gb(kv_cache_bytes),
+        "other_runtime_mem_gb": _bytes_to_gb(other_runtime_bytes),
+
+        "weight_mem_bytes": int(weight_mem_bytes),
+        "peak_mem_bytes": int(peak_mem_bytes),
+        "non_weight_runtime_mem_bytes": int(non_weight_bytes),
+        "kv_cache_mem_bytes": int(kv_cache_bytes),
+        "other_runtime_mem_bytes": int(other_runtime_bytes),
+        "other_runtime_mem_bytes_raw": int(other_runtime_bytes_raw),
+
+        "memory_cache_kind": cache_kind,
+        "memory_cache_batch_size": int(cache_batch_size),
+        "memory_cache_seq_len": int(cache_seq_len),
+    }
+
+
 def _dense_kv_attention_forward(
     attn,
     hidden_states,
@@ -1791,10 +1967,16 @@ def benchmark_generate(model, tokenizer, loader, device, gen_len, num_batches, w
     total_time = 0.0
     total_new_tokens = 0
     rows = []
+    cache_batch_size = None
+    cache_prompt_len = None
 
     for step, (input_ids,) in enumerate(loader):
         input_ids = input_ids.to(device, non_blocking=True)
         attention_mask = torch.ones_like(input_ids, device=device)
+
+        if cache_batch_size is None:
+            cache_batch_size = int(input_ids.shape[0])
+            cache_prompt_len = int(input_ids.shape[1])
 
         torch.cuda.synchronize(device)
         t0 = time.perf_counter()
@@ -1840,14 +2022,16 @@ def benchmark_generate(model, tokenizer, loader, device, gen_len, num_batches, w
 
     peak_mem = torch.cuda.max_memory_allocated(device)
 
-    summary = {
-        "throughput_new_tokens_per_sec": total_new_tokens / total_time,
-        "total_measured_seconds": total_time,
-        "total_new_tokens": total_new_tokens,
-        "weight_mem_gb": weight_mem / 2**30,
-        "peak_mem_gb": peak_mem / 2**30,
-        "activation_cache_mem_gb": (peak_mem - weight_mem) / 2**30,
-    }
+    summary = build_memory_breakdown_summary(
+        model=model,
+        total_time=total_time,
+        total_new_tokens=total_new_tokens,
+        weight_mem_bytes=weight_mem,
+        peak_mem_bytes=peak_mem,
+        cache_batch_size=cache_batch_size,
+        cache_seq_len=cache_prompt_len + gen_len,
+        cache_kind="hf_full",
+    )
 
     return summary, rows
 
@@ -1877,10 +2061,16 @@ def benchmark_generate_lowrank_v_cache(
     total_time = 0.0
     total_new_tokens = 0
     rows = []
+    cache_batch_size = None
+    cache_prompt_len = None
 
     for step, (input_ids,) in enumerate(loader):
         input_ids = input_ids.to(device, non_blocking=True)
         attention_mask = torch.ones_like(input_ids, device=device)
+
+        if cache_batch_size is None:
+            cache_batch_size = int(input_ids.shape[0])
+            cache_prompt_len = int(input_ids.shape[1])
 
         torch.cuda.synchronize(device)
         t0 = time.perf_counter()
@@ -1922,14 +2112,16 @@ def benchmark_generate_lowrank_v_cache(
 
     peak_mem = torch.cuda.max_memory_allocated(device)
 
-    summary = {
-        "throughput_new_tokens_per_sec": total_new_tokens / total_time,
-        "total_measured_seconds": total_time,
-        "total_new_tokens": total_new_tokens,
-        "weight_mem_gb": weight_mem / 2**30,
-        "peak_mem_gb": peak_mem / 2**30,
-        "activation_cache_mem_gb": (peak_mem - weight_mem) / 2**30,
-    }
+    summary = build_memory_breakdown_summary(
+        model=model,
+        total_time=total_time,
+        total_new_tokens=total_new_tokens,
+        weight_mem_bytes=weight_mem,
+        peak_mem_bytes=peak_mem,
+        cache_batch_size=cache_batch_size,
+        cache_seq_len=cache_prompt_len + gen_len,
+        cache_kind="lowrank_v",
+    )
 
     return summary, rows
 
@@ -1966,10 +2158,16 @@ def benchmark_generate_lowrank_kv_cache(
     total_time = 0.0
     total_new_tokens = 0
     rows = []
+    cache_batch_size = None
+    cache_prompt_len = None
 
     for step, (input_ids,) in enumerate(loader):
         input_ids = input_ids.to(device, non_blocking=True)
         attention_mask = torch.ones_like(input_ids, device=device)
+
+        if cache_batch_size is None:
+            cache_batch_size = int(input_ids.shape[0])
+            cache_prompt_len = int(input_ids.shape[1])
 
         torch.cuda.synchronize(device)
         t0 = time.perf_counter()
@@ -2012,14 +2210,16 @@ def benchmark_generate_lowrank_kv_cache(
 
     peak_mem = torch.cuda.max_memory_allocated(device)
 
-    summary = {
-        "throughput_new_tokens_per_sec": total_new_tokens / total_time,
-        "total_measured_seconds": total_time,
-        "total_new_tokens": total_new_tokens,
-        "weight_mem_gb": weight_mem / 2**30,
-        "peak_mem_gb": peak_mem / 2**30,
-        "activation_cache_mem_gb": (peak_mem - weight_mem) / 2**30,
-    }
+    summary = build_memory_breakdown_summary(
+        model=model,
+        total_time=total_time,
+        total_new_tokens=total_new_tokens,
+        weight_mem_bytes=weight_mem,
+        peak_mem_bytes=peak_mem,
+        cache_batch_size=cache_batch_size,
+        cache_seq_len=cache_prompt_len + gen_len,
+        cache_kind="lowrank_kv",
+    )
 
     return summary, rows
 
@@ -2365,12 +2565,26 @@ def main():
         **summary,
     }
 
+    memory_breakdown = {
+        "weight_mem_gb": result_row["weight_mem_gb"],
+        "kv_cache_mem_gb": result_row["kv_cache_mem_gb"],
+        "other_runtime_mem_gb": result_row["other_runtime_mem_gb"],
+        "non_weight_runtime_mem_gb": result_row["non_weight_runtime_mem_gb"],
+        "peak_mem_gb": result_row["peak_mem_gb"],
+        "weight_mem_bytes": result_row["weight_mem_bytes"],
+        "kv_cache_mem_bytes": result_row["kv_cache_mem_bytes"],
+        "other_runtime_mem_bytes": result_row["other_runtime_mem_bytes"],
+        "non_weight_runtime_mem_bytes": result_row["non_weight_runtime_mem_bytes"],
+        "memory_cache_kind": result_row["memory_cache_kind"],
+    }
+
     payload = {
         "timestamp": run_timestamp,
         "command": run_command,
         "argv": sys.argv,
         "args": vars(args),
         "summary": result_row,
+        "memory_breakdown": memory_breakdown,
         "per_batch": batch_rows,
     }
 
